@@ -37,6 +37,7 @@ struct ParsedType {
 
 fn is_graphql_simple_type_name(name: &str) -> bool {
     match name {
+        "ID" => true,
         "String" => true,
         "Int" => true,
         "i32" => true,
@@ -169,7 +170,13 @@ struct GraphQLDeriveParams {
 #[deluxe(attributes(graphql))]
 struct GraphQLDeriveAttributeParams {
     #[deluxe(default = false)]
-    required: bool
+    required: bool,
+
+    #[deluxe(default = false)]
+    scalar: bool,
+
+    #[deluxe(default = false)]
+    no_params: bool
 }
 
 fn derive_graphql_type2(item: proc_macro2::TokenStream) -> deluxe::Result<proc_macro2::TokenStream> {
@@ -191,7 +198,7 @@ fn derive_graphql_type2(item: proc_macro2::TokenStream) -> deluxe::Result<proc_m
     let lit = proc_macro2::Literal::string(&names);
     let expanded = quote! {
         impl #impl_generics GraphQLType<#params_ident> for #ident #ty_generics #where_clause {
-            fn get_query_part(params: &#params_ident, prefix: String) -> String {
+            fn get_query_part(params: &#params_ident, prefix: &str) -> String {
                 // #lit.to_string(#args)
                 format!(#lit, #args)
             }
@@ -220,6 +227,7 @@ deluxe::Result<(String, TokenStream)> {
     let mut args: Vec<TokenStream> = Vec::new();
 
     for f in fields {
+        let attrs: GraphQLDeriveAttributeParams = deluxe::extract_attributes(f)?;
 
         let ident = &f.ident;
 
@@ -246,7 +254,7 @@ deluxe::Result<(String, TokenStream)> {
 
         let parsed_type = parse_type(&f.ty);
         if let Some(parsed_type) = parsed_type {
-            if parsed_type.scalar {
+            if attrs.scalar || parsed_type.scalar {
                 names.push_str(&name);
                 names.push('\n');
     
@@ -283,9 +291,18 @@ deluxe::Result<(String, TokenStream)> {
                 }
                 names.push_str("}}\n");
     
-                let arg = quote_spanned! {f.span()=>
-                    params.#ident.get_actual(GraphQL::prefix(&prefix, #field_name)),
-                    #type_name::get_query_part(&params.#ident, GraphQL::prefix(&prefix, #field_name))
+                let arg = if attrs.no_params {
+                    quote_spanned! {f.span()=>
+                        &NoParams,
+                        #type_name::get_query_part(&NoParams, &GraphQL::prefix(prefix, #field_name))
+                    }
+
+                } 
+                else { 
+                    quote_spanned! {f.span()=>
+                        params.#ident.get_actual(&GraphQL::prefix(prefix, #field_name)),
+                        #type_name::get_query_part(&params.#ident, &GraphQL::prefix(prefix, #field_name))
+                    }
                 };
     
                 eprintln!(" other type {}", &name);
@@ -358,16 +375,16 @@ fn derive_graphql_query_params2(item: proc_macro2::TokenStream) -> deluxe::Resul
     let expanded = quote! {
         // The generated impl.
         impl #impl_generics GraphQLQueryParams for #ident #ty_generics #where_clause {
-            fn get_formal_part(&self, params: &mut ParamBuffer, prefix: String) {
+            fn get_formal_part(&self, params: &mut ParamBuffer, prefix: &str) {
                 #formal
             }
 
-            fn get_actual_part(&self, params: &mut ParamBuffer, prefix: String){
+            fn get_actual_part(&self, params: &mut ParamBuffer, prefix: &str){
                 #actual
                 
             }
         
-            fn get_variables_part(&self, variables: &mut VariableBuffer, prefix: String) -> Result<(), serde_json::Error> {
+            fn get_variables_part(&self, variables: &mut VariableBuffer, prefix: &str) -> Result<(), serde_json::Error> {
                 #variable
                 Ok(())
             }
@@ -387,6 +404,15 @@ fn derive_graphql_query_params2(item: proc_macro2::TokenStream) -> deluxe::Resul
 pub fn derive_graphql_query_params(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
     derive_graphql_query_params2(item.into()).unwrap().into()
+}
+
+fn get_graphql_query_enum_parts(variants: &syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>)  -> 
+    deluxe::Result<(TokenStream, TokenStream, TokenStream)> {
+    let mut formal: Vec<TokenStream> = Vec::new();
+    let mut actual: Vec<TokenStream> = Vec::new();
+    let mut variable: Vec<TokenStream> = Vec::new();
+
+    Ok((quote!{#(#formal;)*}, quote!{#(#actual;)*}, quote!{#(#variable?;)*}))
 }
 
 fn get_graphql_query_parts(fields: &mut syn::punctuated::Punctuated<syn::Field, syn::token::Comma>) -> 
@@ -421,32 +447,32 @@ fn get_graphql_query_parts(fields: &mut syn::punctuated::Punctuated<syn::Field, 
                 let camel_name = Literal::string(&to_camel_case(&name));
                 
                 actual.push(quote_spanned! {f.span()=>
-                    params.push_actual(&prefix, #camel_name)
+                    params.push_actual(prefix, #camel_name)
                     // Actual
                 });
 
                 formal.push(quote_spanned! {f.span()=>
-                    params.push_formal(&prefix, #camel_name, #type_name)
+                    params.push_formal(prefix, #camel_name, #type_name)
                     // Formal
                 });
 
                 variable.push(quote_spanned! {f.span()=>
-                    variables.push_variable(&prefix, #camel_name, &self.#ident)
+                    variables.push_variable(prefix, #camel_name, &self.#ident)
                     // Variable
                 });
             }
             else {
             // actual.push(quote_spanned! {f.span()=>
-            //     params.push_actual(&prefix, "act",);
+            //     params.push_actual(prefix, "act",);
             //     self.properties.get_formal_part(params, Self::prefix(prefix, #name))
             // });
 
             formal.push(quote_spanned! {f.span()=>
-                self.#ident.get_formal_part(params, GraphQL::prefix(&prefix, #name))
+                self.#ident.get_formal_part(params, &GraphQL::prefix(prefix, #name))
             });
 
             variable.push(quote_spanned! {f.span()=>
-                self.#ident.get_variables_part(variables, GraphQL::prefix(&prefix, #name))
+                self.#ident.get_variables_part(variables, &GraphQL::prefix(prefix, #name))
                 // self.properties.get_formal_part(params, Self::prefix(prefix, #name))
             });
             }
@@ -466,18 +492,6 @@ fn impl_graphql_query_params(data: &mut Data) -> deluxe::Result<(TokenStream, To
         Data::Struct(data) => {
             match &mut data.fields {
                 Fields::Named(fields) => {
-                    // Expands to an expression like
-                    //
-                    //     0 + self.x.heap_size() + self.y.heap_size() + self.z.heap_size()
-                    //
-                    // but using fully qualified function call syntax.
-                    //
-                    // We take some care to use the span of each `syn::Field` as
-                    // the span of the corresponding `heap_size_of_children`
-                    // call. This way if one of the field types does not
-                    // implement `HeapSize` then the compiler's error message
-                    // underlines which field it is. An example is shown in the
-                    // readme of the parent directory.
 
                     get_graphql_query_parts(&mut fields.named)
                 }
@@ -489,7 +503,10 @@ fn impl_graphql_query_params(data: &mut Data) -> deluxe::Result<(TokenStream, To
                 }
             }
         }
-        Data::Enum(_) | Data::Union(_) => unimplemented!(),
+        Data::Enum(data_enum) => {
+            get_graphql_query_enum_parts(&data_enum.variants)
+        },
+        Data::Union(_) => unimplemented!(),
     }
 }
 
