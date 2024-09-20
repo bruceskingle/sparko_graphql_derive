@@ -162,9 +162,29 @@ fn parse_type(ty: &Type) -> Option<ParsedType> {
 #[derive(deluxe::ExtractAttributes)]
 #[deluxe(attributes(graphql))]
 struct GraphQLDeriveParams {
-    params: String
+    params: String,
+    super_type: Option<Vec<String>>
 }
 
+#[derive(deluxe::ExtractAttributes)]
+#[deluxe(attributes(serde))]
+struct SerdeDeriveParams {
+    rename_all: Option<String>,
+    rename_all_fields: Option<String>,
+    deny_unknown_fields: Option<String>,
+    tag: Option<String>,
+    content: Option<String>,
+    untagged: Option<bool>,
+    bound: Option<String>,
+    default: Option<bool>,
+    remote: Option<String>,
+    transparent: Option<bool>,
+    from: Option<String>,
+    try_from: Option<String>,
+    into: Option<String>,
+    // r#crate: Option<String>,
+    expecting: Option<String>,
+}
 
 #[derive(deluxe::ExtractAttributes)]
 #[deluxe(attributes(graphql))]
@@ -176,15 +196,27 @@ struct GraphQLDeriveAttributeParams {
     scalar: bool,
 
     #[deluxe(default = false)]
-    no_params: bool
+    no_params: bool,
+
+    rename: Option<String>
+}
+
+#[derive(deluxe::ExtractAttributes)]
+#[deluxe(attributes(serde))]
+struct SerdeDeriveAttributeParams {
+    #[deluxe(default = false)]
+    flatten: bool,
+    rename: Option<String>
 }
 
 fn derive_graphql_type2(item: proc_macro2::TokenStream) -> deluxe::Result<proc_macro2::TokenStream> {
     let mut ast: DeriveInput = syn::parse2(item)?;
 
     // Extract the attributes!
-    let GraphQLDeriveParams { params } = deluxe::extract_attributes(&mut ast)?;
-    let params_ident = Ident::new(&params, ast.span());
+    let derive_params: GraphQLDeriveParams = deluxe::extract_attributes(&mut ast)?;
+    let serde_derive_params: SerdeDeriveParams = deluxe::extract_attributes(&mut ast)?;
+
+    let params_ident = Ident::new(&derive_params.params, ast.span());
     // define impl variables
 
     let ident = ast.ident;
@@ -192,13 +224,13 @@ fn derive_graphql_type2(item: proc_macro2::TokenStream) -> deluxe::Result<proc_m
     let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
 
 
-    let (names, args) = impl_graphql_type_params(&mut ast.data)?;
+    let (names, args) = impl_graphql_type_params(&mut ast.data, &ident, &derive_params, &serde_derive_params)?;
 
 
     let lit = proc_macro2::Literal::string(&names);
     let expanded = quote! {
         impl #impl_generics GraphQLType<#params_ident> for #ident #ty_generics #where_clause {
-            fn get_query_part(params: &#params_ident, prefix: &str) -> String {
+            fn get_query_attributes(params: &#params_ident, prefix: &str) -> String {
                 // #lit.to_string(#args)
                 format!(#lit, #args)
             }
@@ -221,13 +253,20 @@ pub fn derive_graphql_type(item: proc_macro::TokenStream) -> proc_macro::TokenSt
     derive_graphql_type2(item.into()).unwrap().into()
 }
 
-fn get_graphql_type_parts(fields: &mut syn::punctuated::Punctuated<syn::Field, syn::token::Comma>) -> 
+fn get_graphql_type_parts(fields: &mut syn::punctuated::Punctuated<syn::Field, syn::token::Comma>, struct_name: &Ident) -> 
 deluxe::Result<(String, TokenStream)> {
     let mut names = String::new();
     let mut args: Vec<TokenStream> = Vec::new();
+    let mut has_fields = false;
+    let mut has_flattened = false;
 
+         
+    // names.push_str("{{\n");
     for f in fields {
         let attrs: GraphQLDeriveAttributeParams = deluxe::extract_attributes(f)?;
+        let serde_attrs: SerdeDeriveAttributeParams = deluxe::extract_attributes(f)?;
+
+       
 
         let ident = &f.ident;
 
@@ -239,6 +278,10 @@ deluxe::Result<(String, TokenStream)> {
         };
 
         let mut name = ident.to_string();
+
+if serde_attrs.flatten {
+    eprintln!("FLATTEN {}", name)
+}
 
         if !name.starts_with("__") {
             name = to_camel_case(&name);
@@ -254,66 +297,249 @@ deluxe::Result<(String, TokenStream)> {
 
         let parsed_type = parse_type(&f.ty);
         if let Some(parsed_type) = parsed_type {
-            if attrs.scalar || parsed_type.scalar {
-                names.push_str(&name);
-                names.push('\n');
-    
-                eprintln!(" GQL type {}", parsed_type.type_name.to_string());
+            if serde_attrs.flatten {
+                has_flattened = true;
+                names.push_str(&format!("# flattened {}\n", name))
             }
             else {
-                // eprintln!(" other type container {:?}", info.container_type);
-                eprintln!(" other type name {}", parsed_type.type_name);
-                let type_name = Ident::new(&parsed_type.type_name, f.span().clone());
-
-                names.push_str(&name);
-                names.push_str("{}{{\n");
-
-                if parsed_type.page_forward || parsed_type.page_reverse {
-                    names.push_str("    pageInfo {{\n");
-                    if parsed_type.page_forward {
-                        names.push_str("        startCursor\n");
-                        names.push_str("        hasNextPage\n");
-                    }
-                    if parsed_type.page_reverse {
-
-                        names.push_str("        endCursor\n");
-                        names.push_str("        hasPreviousPage\n");
-                    }
-                    names.push_str("    }}\n");
-                    names.push_str("    edges {{\n");
-                    names.push_str("        node {{\n");
-                    names.push_str("                {}\n");
-                    names.push_str("        }}\n");
-                    names.push_str("    }}\n");
+                has_fields = true;
+                if attrs.scalar || parsed_type.scalar {
+                    names.push_str(&name);
+                    names.push('\n');
+        
+                    eprintln!(" GQL type {}", parsed_type.type_name.to_string());
                 }
-                else {                    
-                    names.push_str("    {}\n");
-                }
-                names.push_str("}}\n");
-    
-                let arg = if attrs.no_params {
-                    quote_spanned! {f.span()=>
-                        &NoParams,
-                        #type_name::get_query_part(&NoParams, &GraphQL::prefix(prefix, #field_name))
-                    }
+                else {
+                    // eprintln!(" other type container {:?}", info.container_type);
+                    eprintln!(" other type name {}", parsed_type.type_name);
+                    let type_name = Ident::new(&parsed_type.type_name, f.span().clone());
 
-                } 
-                else { 
-                    quote_spanned! {f.span()=>
-                        params.#ident.get_actual(&GraphQL::prefix(prefix, #field_name)),
-                        #type_name::get_query_part(&params.#ident, &GraphQL::prefix(prefix, #field_name))
+                    names.push_str(&name);
+                    // names.push_str("{}{{\n");
+                    names.push_str("{}\n");
+
+                    if parsed_type.page_forward || parsed_type.page_reverse {
+                        names.push_str(&format!("  # pageOf {}\n", camel_name));
+                        names.push_str("  {{ # pageOf\n");
+                        names.push_str("    pageInfo {{\n");
+                        if parsed_type.page_forward {
+                            names.push_str("        startCursor\n");
+                            names.push_str("        hasNextPage\n");
+                        }
+                        if parsed_type.page_reverse {
+
+                            names.push_str("        endCursor\n");
+                            names.push_str("        hasPreviousPage\n");
+                        }
+                        names.push_str("    }}\n");
+                        names.push_str("    edges {{ # pageOf.edges\n");
+
+                        names.push_str(&format!("  # pageOf.node {}\n", camel_name));
+                        names.push_str("        node {}\n");
+
+                        names.push_str(&format!("  # /pageOf.node {}\n", camel_name));
+                        names.push_str("    }} # /pageOf.edges\n");
+                        names.push_str("  }} # /pageOf\n");
+
+                        names.push_str(&format!("  # /pageOf {}\n", camel_name));
                     }
-                };
-    
-                eprintln!(" other type {}", &name);
-                eprintln!("        arg {}", &arg);
-            
-                args.push(arg);
+                    else {          
+                        names.push_str(&format!("  # object {}\n", camel_name));     
+                        // names.push_str("  {{ # object\n");     
+                        names.push_str("    {}\n");
+                        // names.push_str("  }} # /object\n");
+                            
+                        names.push_str(&format!("  # /object {}\n", camel_name));  
+                    }
+                    // names.push_str("}}\n");
+        
+                    let arg = if attrs.no_params {
+                        quote_spanned! {f.span()=>
+                            "",
+                            #type_name::get_query_part(&NoParams, &GraphQL::prefix(prefix, #field_name))
+                        }
+
+                    } 
+                    else { 
+                        quote_spanned! {f.span()=>
+                            params.#ident.get_actual(&GraphQL::prefix(prefix, #field_name)),
+                            #type_name::get_query_part(&params.#ident, &GraphQL::prefix(prefix, #field_name))
+                        }
+                    };
+        
+                    eprintln!(" other type {}", &name);
+                    eprintln!("        arg {}", &arg);
+                
+                    args.push(arg);
+                }
             }
         }
         else {
             panic!("Unrecognised type {:?}", &f.ty);
         }
+    }
+    // names.push_str("}}\n");
+
+    if has_fields && has_flattened {
+        names = format!("...on {} {{{{\n{}\n}}}}\n", struct_name.to_string(), names);
+    }
+    
+    Ok((names, quote!{#(#args,)*}))
+}
+
+fn get_graphql_type_enum_parts(variants: &mut syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>, struct_name: &Ident, derive_params: &GraphQLDeriveParams, serde_derive_params: &SerdeDeriveParams) -> 
+deluxe::Result<(String, TokenStream)> {
+    let mut names = String::new();
+    let mut args: Vec<TokenStream> = Vec::new();
+
+    if let Some(tag) = &serde_derive_params.tag {
+        names.push_str(&tag);
+        names.push('\n');
+    }
+    // names.push_str(&format!("/* super {:?}*/", derive_params.super_type));
+    if let Some(super_types) = &derive_params.super_type {
+        for super_type in super_types {
+            names.push_str("{}\n");
+
+            let super_type_name = Ident::new(&super_type, variants.span().clone());
+            
+            
+            let arg = 
+                quote_spanned! {variants.span()=>
+                    #super_type_name::get_query_attributes(params, prefix) //&GraphQL::prefix(prefix, #variant_name))
+                };
+        
+            args.push(arg);
+        }
+    }
+         
+    // names.push_str("{{\n");
+    for v in variants {
+        let attrs: GraphQLDeriveAttributeParams = deluxe::extract_attributes(v)?;
+        let serde_attrs: SerdeDeriveAttributeParams = deluxe::extract_attributes(v)?;
+
+       
+
+        let ident = &v.ident;
+
+        let mut name = ident.to_string();
+
+if serde_attrs.flatten {
+    eprintln!("FLATTEN {}", name)
+}
+
+        if !name.starts_with("__") {
+            name = to_camel_case(&name);
+        }
+        let variant_name: Literal = Literal::string(&name);
+        let camel_name = Literal::string(&to_camel_case(&name));
+
+        eprintln!(" name {}", &name);
+        eprintln!(" variant_name {}", &variant_name);
+        eprintln!(" name {}", &camel_name);
+
+        eprintln!("FIELD {}", name);
+
+        let fields = &v.fields;
+
+        match &mut v.fields {
+            Fields::Named(fields) => {
+                panic!("Named fields in enum not supported");
+            }
+            Fields::Unnamed(ref fields) => {
+
+                let mut i = 0;
+                for f in &fields.unnamed {
+                    if i == 0 {
+                        i = 1;
+                    }
+                    else {
+                        panic!("Multiple fields in enum not supported");
+                    }
+                }
+
+                let the_field = fields.unnamed.iter().next().unwrap();
+
+                
+
+                let parsed_type = parse_type(&the_field.ty);
+                if let Some(parsed_type) = parsed_type {
+                    if attrs.scalar || parsed_type.scalar {
+                        panic!("Scalar filed in enum not supported");
+
+                        // maybe this would work:
+                        // names.push_str(&name);
+                        // names.push('\n');
+            
+                        // eprintln!(" GQL type {}", parsed_type.type_name.to_string());
+                    }
+                    else {
+                        eprintln!(" other type name {}", parsed_type.type_name);
+                        let type_name = Ident::new(&parsed_type.type_name, v.span().clone());
+
+                        names.push_str(&format!("  # enum variant {}\n", name));
+                        names.push_str("  {}\n");
+
+
+                        names.push_str(&format!("  # /enum variant {}\n", name));
+
+
+                        // names.push_str(&name);
+                        // // names.push_str("{}{{\n");
+                        // names.push_str("{}\n");
+
+                        // if parsed_type.page_forward || parsed_type.page_reverse {
+                        //     names.push_str(&format!("  # pageOf {}\n", camel_name));
+                        //     names.push_str("  {{ # pageOf\n");
+                        //     names.push_str("    pageInfo {{\n");
+                        //     if parsed_type.page_forward {
+                        //         names.push_str("        startCursor\n");
+                        //         names.push_str("        hasNextPage\n");
+                        //     }
+                        //     if parsed_type.page_reverse {
+
+                        //         names.push_str("        endCursor\n");
+                        //         names.push_str("        hasPreviousPage\n");
+                        //     }
+                        //     names.push_str("    }}\n");
+                        //     names.push_str("    edges {{ # pageOf.edges\n");
+
+                        //     names.push_str(&format!("  # pageOf.node {}\n", camel_name));
+                        //     names.push_str("        node {}\n");
+
+                        //     names.push_str(&format!("  # /pageOf.node {}\n", camel_name));
+                        //     names.push_str("    }} # /pageOf.edges\n");
+                        //     names.push_str("  }} # /pageOf\n");
+
+                        //     names.push_str(&format!("  # /pageOf {}\n", camel_name));
+                        // }
+                        // else {          
+                        //     names.push_str(&format!("  # object {}\n", camel_name));     
+                        //     // names.push_str("  {{ # object\n");     
+                        //     names.push_str("    {}\n");
+                        //     // names.push_str("  }} # /object\n");
+                                
+                        //     names.push_str(&format!("  # /object {}\n", camel_name));  
+                        // }
+                        // // names.push_str("}}\n");
+            
+                        let arg = 
+                            quote_spanned! {v.span()=>
+                                #type_name::get_query_attributes(params, prefix) //&GraphQL::prefix(prefix, #variant_name))
+                            };
+                    
+                        args.push(arg);
+                    }
+                }
+                else {
+                    panic!("Unrecognised type {:?}", &the_field.ty);
+                }
+            }
+            Fields::Unit => {
+                panic!("Unit field in enum not supported");
+            }
+        }
+        
     }
     
     Ok((names, quote!{#(#args,)*}))
@@ -321,35 +547,25 @@ deluxe::Result<(String, TokenStream)> {
 
 
 
-fn impl_graphql_type_params(data: &mut Data) -> deluxe::Result<(String, TokenStream)> {
+fn impl_graphql_type_params(data: &mut Data, struct_name: &Ident, derive_params: &GraphQLDeriveParams, serde_derive_params: &SerdeDeriveParams) -> deluxe::Result<(String, TokenStream)> {
     match data {
         Data::Struct(data) => {
             match &mut data.fields {
                 Fields::Named(fields) => {
-                    // Expands to an expression like
-                    //
-                    //     0 + self.x.heap_size() + self.y.heap_size() + self.z.heap_size()
-                    //
-                    // but using fully qualified function call syntax.
-                    //
-                    // We take some care to use the span of each `syn::Field` as
-                    // the span of the corresponding `heap_size_of_children`
-                    // call. This way if one of the field types does not
-                    // implement `HeapSize` then the compiler's error message
-                    // underlines which field it is. An example is shown in the
-                    // readme of the parent directory.
-
-                    get_graphql_type_parts(&mut fields.named)
+                    get_graphql_type_parts(&mut fields.named, struct_name)
                 }
                 Fields::Unnamed(ref _fields) => {
-                    unimplemented!();
+                    panic!("Unnamed struct fields not supported");
                 }
                 Fields::Unit => {
-                    unimplemented!();
+                    panic!("Unit struct fields not supported");
                 }
             }
-        }
-        Data::Enum(_) | Data::Union(_) => unimplemented!(),
+        },
+        Data::Enum(data) => {
+            get_graphql_type_enum_parts(&mut data.variants, struct_name, derive_params, serde_derive_params)
+        },
+        Data::Union(_) => panic!("Unions not supported"),
     }
 }
 
@@ -444,7 +660,12 @@ fn get_graphql_query_parts(fields: &mut syn::punctuated::Punctuated<syn::Field, 
                     type_name_string.push('!');
                 }
                 let type_name = Literal::string(&&type_name_string);
-                let camel_name = Literal::string(&to_camel_case(&name));
+                let camel_name = if let Some(rename) = attrs.rename {
+                    Literal::string(&rename)
+                }
+                else {
+                    Literal::string(&to_camel_case(&name))
+                };
                 
                 actual.push(quote_spanned! {f.span()=>
                     params.push_actual(prefix, #camel_name)
@@ -462,19 +683,20 @@ fn get_graphql_query_parts(fields: &mut syn::punctuated::Punctuated<syn::Field, 
                 });
             }
             else {
-            // actual.push(quote_spanned! {f.span()=>
-            //     params.push_actual(prefix, "act",);
-            //     self.properties.get_formal_part(params, Self::prefix(prefix, #name))
-            // });
+                actual.push(quote_spanned! {f.span()=>
+                    // // params.push_actual(#camel_name, &GraphQL::prefix(prefix, #name));
+                    // // self.properties.get_formal_part(params, Self::prefix(prefix, #name))
+                    // self.#ident.get_actual_part(params, &GraphQL::prefix(prefix, #name))
+                });
 
-            formal.push(quote_spanned! {f.span()=>
-                self.#ident.get_formal_part(params, &GraphQL::prefix(prefix, #name))
-            });
+                formal.push(quote_spanned! {f.span()=>
+                    self.#ident.get_formal_part(params, &GraphQL::prefix(prefix, #name))
+                });
 
-            variable.push(quote_spanned! {f.span()=>
-                self.#ident.get_variables_part(variables, &GraphQL::prefix(prefix, #name))
-                // self.properties.get_formal_part(params, Self::prefix(prefix, #name))
-            });
+                variable.push(quote_spanned! {f.span()=>
+                    self.#ident.get_variables_part(variables, &GraphQL::prefix(prefix, #name))
+                    // self.properties.get_formal_part(params, Self::prefix(prefix, #name))
+                });
             }
         }
         else {
@@ -496,17 +718,17 @@ fn impl_graphql_query_params(data: &mut Data) -> deluxe::Result<(TokenStream, To
                     get_graphql_query_parts(&mut fields.named)
                 }
                 Fields::Unnamed(ref _fields) => {
-                    unimplemented!();
+                    panic!("Unnamed query param struct fields not supported");
                 }
                 Fields::Unit => {
-                    unimplemented!();
+                    panic!("Unit query params struct fields not supported");
                 }
             }
         }
         Data::Enum(data_enum) => {
             get_graphql_query_enum_parts(&data_enum.variants)
         },
-        Data::Union(_) => unimplemented!(),
+        Data::Union(_) => panic!("Union queries struct fields not supported"),
     }
 }
 
